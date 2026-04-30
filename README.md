@@ -1,4 +1,4 @@
-# AWS Youtube Project
+# AWS YouTube Project
 
 ## Executive Summary
 
