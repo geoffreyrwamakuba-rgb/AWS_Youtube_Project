@@ -7,7 +7,7 @@ This project builds an end-to-end, scalable data pipeline to ingest, process, an
 The pipeline is designed with modularity, scalability, and data quality in mind, following modern data engineering best practices.
 
 ## Data Flow
-![ ](https://github.com/geoffreyrwamakuba-rgb/Spark-Declarative-Pipeline-Project/blob/a00f521355dfc2e9d10525cd4e1c14ce22511619/SDP_data_model.png)
+![ ](https://github.com/geoffreyrwamakuba-rgb/AWS_Youtube_Project/blob/4144f6a8b43428482cfd3e4ff1f74559755a1022/Images/AWS_Data_Flow.drawio)
 
 ## Project Overview
 This project implements a cloud-native ETL pipeline using AWS to process YouTube trending and metadata datasets.
@@ -59,7 +59,7 @@ Storage Layer
 Analytics Layer
 - Athena queries for reporting and dashboards
 
-![ ](https://github.com/geoffreyrwamakuba-rgb/Spark-Declarative-Pipeline-Project/blob/a00f521355dfc2e9d10525cd4e1c14ce22511619/SDP_data_model.png)
+![ ](https://github.com/geoffreyrwamakuba-rgb/AWS_Youtube_Project/blob/4144f6a8b43428482cfd3e4ff1f74559755a1022/Images/stepfunctions_graph.svg)
 ---
 
 ## 📂 Repository Structure
