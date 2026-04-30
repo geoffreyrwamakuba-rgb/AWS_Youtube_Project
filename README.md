@@ -7,7 +7,7 @@ This project builds an end-to-end, scalable data pipeline to ingest, process, an
 The pipeline is designed with modularity, scalability, and data quality in mind, following modern data engineering best practices.
 
 ## Data Flow
-![ ](https://github.com/geoffreyrwamakuba-rgb/AWS_Youtube_Project/blob/93d79aa986bbbca2c27917b0c11077e416f8cabe/Images/AWS_Data_Flow.png)
+![ ](https://github.com/geoffreyrwamakuba-rgb/AWS_Youtube_Project/blob/a6725ad6a5d673be6f134c0c5019ed91dbabb54f/Images/AWS_Data_Flow.png)
 
 ## Project Overview
 This project implements a cloud-native ETL pipeline using AWS to process YouTube trending and metadata datasets.
@@ -73,8 +73,8 @@ youtube-data-pipeline-2026/
 │       └── lambda_function.py         # Converts JSON category mappings to Parquet
 │
 ├── glue_jobs/
-│   ├── bronze_to_silver_statistics.py # PySpark job: raw data → cleansed statistics
-│   └── silver_to_gold_analytics.py    # PySpark job: cleansed data → business aggregations
+│   ├── bronze_to_silver_statistics.py # PySpark job: raw data → cleaned statistics
+│   └── silver_to_gold_analytics.py    # PySpark job: cleaned data → business aggregations
 │
 ├── data_quality/
 │   └── dq_lambda.py                   # Data quality validation Lambda
@@ -87,7 +87,7 @@ youtube-data-pipeline-2026/
 │   └── information.md                 # AWS resource names & configuration reference
 │
 ├── data/                              # Reference & historical data
-│   ├── {region}videos.csv             # Kaggle trending video datasets (10 regions)
+│   ├── {region}_videos.csv            # Kaggle trending video datasets (10 regions)
 │   └── {region}_category_id.json      # YouTube category ID mappings (10 regions)
 │
 └── Images.png                         # Supporting diagrams
