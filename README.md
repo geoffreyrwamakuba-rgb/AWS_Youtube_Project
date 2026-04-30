@@ -7,9 +7,7 @@ This project builds an end-to-end, scalable data pipeline to ingest, process, an
 The pipeline is designed with modularity, scalability, and data quality in mind, following modern data engineering best practices.
 
 ## Data Flow
-
 ![ ](https://github.com/geoffreyrwamakuba-rgb/Spark-Declarative-Pipeline-Project/blob/a00f521355dfc2e9d10525cd4e1c14ce22511619/SDP_data_model.png)
----
 
 ## Project Overview
 This project implements a cloud-native ETL pipeline using AWS to process YouTube trending and metadata datasets.
@@ -26,7 +24,7 @@ Tech Stack
 
 ### 🏢 Business Scenario
 
-#### Context
+### Context
 
 A marketing client wants to understand:
 - What content performs best across regions
@@ -34,12 +32,12 @@ A marketing client wants to understand:
 - Category-level performance
 - Opportunities for campaign optimisation
 
-#### The Problem
+### ❌ The Problem
 - Raw YouTube data is unstructured and fragmented
 - Manual analysis is time-consuming and not scalable
 - No automated pipeline for continuous ingestion and reporting
 
-#### The Solution
+### ✅ The Solution
 A fully automated pipeline that:
 1. Ingests raw YouTube data into S3
 2. Cleans and structures data using AWS Glue
@@ -49,7 +47,7 @@ A fully automated pipeline that:
 
 ### Pipeline Orchestration (Step Functions DAG)
 
-The pipeline follows a DAG structure:
+**The pipeline follows a DAG structure:**
 
 Ingestion Layer 
 - Upload raw CSV/JSON data to S3 (Bronze layer)
@@ -65,26 +63,32 @@ Analytics Layer
 ---
 
 ## 📂 Repository Structure
-
-```bash
-├── 01_project_setup/        # Initial setup of the Databricks environment - Unity Catalog schema
+```
+youtube-data-pipeline-2026/
 │
-├── 02_bronze/
-│   ├── city.py              # Batch ingestion of raw city data into Bronze Delta table from S3
-│   ├── trips.py             # Streaming ingestion of trips data using Auto Loader
+├── lambdas/
+│   ├── youtube_api_integstion/        # Ingestion Lambda
+│   │   └── lambda_function.py         # Fetches trending videos & categories from YouTube API
+│   └── json_to_parquet/               # Reference data transformation Lambda
+│       └── lambda_function.py         # Converts JSON category mappings to Parquet
 │
-├── 03_silver/
-│   ├── calendar.py          # Dynamically generates a date dimension table
-│   ├── city.py              # Cleans and standardises city dimension data
-│   ├── trips.py             # Applies data quality expectations + Standardises schema and column names
-│   ├── trips2.py            # Implements CDC-based upsert into Silver trips table using SDP
-│  
-├── 04_gold/ 
-│   ├── trips_gold.sql       # Builds final fact table for analytics
-│   ├── city_views.sql       # Creates city-level aggregated views
+├── glue_jobs/
+│   ├── bronze_to_silver_statistics.py # PySpark job: raw data → cleansed statistics
+│   └── silver_to_gold_analytics.py    # PySpark job: cleansed data → business aggregations
 │
-├── 05_data/
-│   ├── trips                # Raw trips CSV files (full + incremental loads)
-│   └── city                 # Raw city dimension data
+├── data_quality/
+│   └── dq_lambda.py                   # Data quality validation Lambda
 │
-└── README.md               
+├── step_functions/
+│   └── pipeline_orchestation.json     # Step Functions state machine definition
+│
+├── scripts/
+│   ├── aws_copy.sh                    # Upload historical data to Bronze S3 bucket
+│   └── information.md                 # AWS resource names & configuration reference
+│
+├── data/                              # Reference & historical data
+│   ├── {region}videos.csv             # Kaggle trending video datasets (10 regions)
+│   └── {region}_category_id.json      # YouTube category ID mappings (10 regions)
+│
+└── Images.png                         # Supporting diagrams
+```
