@@ -49,17 +49,51 @@ A fully automated pipeline that:
 
 **The pipeline follows a DAG structure:**
 
-Ingestion Layer 
-- Upload raw CSV/JSON data to S3 (Bronze layer)
-Processing Layer 
-- Lambda triggers transformation jobs
-- Glue jobs clean, normalize, and enrich data
-Storage Layer
-- Data stored in partitioned format (Parquet)
-Analytics Layer
-- Athena queries for reporting and dashboards
+Ingestion Layer --> Processing Layer --> Storage Layer --> Analytics Layer
 
 ![ ](https://github.com/geoffreyrwamakuba-rgb/AWS_Youtube_Project/blob/4144f6a8b43428482cfd3e4ff1f74559755a1022/Images/stepfunctions_graph.svg)
+---
+
+### 🚀 Key Features / Industry Best Practices
+
+1. Idempotent Data Ingestion
+- Uses stable ingestion IDs derived from event timestamps to prevent duplicate loads
+- Checks for existing S3 objects before writing (idempotency guard)
+- Ensures safe retries if jobs are triggered multiple times
+
+👉 Prevents duplicate data when schedulers (e.g. EventBridge) fire twice
+
+2. Resilient API Handling
+- Implements retry logic with exponential backoff for transient failures
+- Handles HTTP errors explicitly (e.g. quota exhaustion)
+- Uses persistent HTTP sessions for connection reuse
+
+👉 Ensures pipeline stability when dealing with external APIs
+
+3. Pagination & Full Data Extraction
+- Iteratively retrieves all available pages from the API
+- Avoids partial datasets caused by single-call limits
+
+👉 Guarantees completeness of ingested data
+
+4. Data Quality as a First-Class Step - Dedicated validation layer before downstream processing
+
+Includes:
+- Row count thresholds
+- Null checks on critical fields
+- Schema validation
+- Value range checks
+- Data freshness checks
+
+👉 Prevents bad data from propagating into analytics
+
+5. Observability & Monitoring
+- Structured JSON logging for queryable logs
+- CloudWatch metrics (e.g. API quota usage)
+- SNS alerts for failures
+
+👉 Enables fast debugging and proactive monitoring
+
 ---
 
 ## 📂 Repository Structure
