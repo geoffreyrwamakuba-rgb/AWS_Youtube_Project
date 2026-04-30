@@ -7,7 +7,7 @@ This project builds an end-to-end, scalable data pipeline to ingest, process, an
 The pipeline is designed with modularity, scalability, and data quality in mind, following modern data engineering best practices.
 
 ## Data Flow
-![ ](https://github.com/geoffreyrwamakuba-rgb/AWS_Youtube_Project/blob/4144f6a8b43428482cfd3e4ff1f74559755a1022/Images/AWS_Data_Flow.drawio)
+![ ](https://github.com/geoffreyrwamakuba-rgb/AWS_Youtube_Project/blob/93d79aa986bbbca2c27917b0c11077e416f8cabe/Images/AWS_Data_Flow.png)
 
 ## Project Overview
 This project implements a cloud-native ETL pipeline using AWS to process YouTube trending and metadata datasets.
