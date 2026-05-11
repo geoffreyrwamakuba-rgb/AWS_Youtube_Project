@@ -1,358 +1,341 @@
 """
-Lambda: YouTube Data API Ingestion (Bronze Layer)
-──────────────────────────────────────────────────
-Triggered by EventBridge on a schedule (e.g., every 6 hours).
-Pulls trending videos from the YouTube Data API for each configured region
-and writes raw JSON responses to the Bronze S3 bucket.
+Glue Job: Bronze → Silver (Statistics Data)
+────────────────────────────────────────────
+Reads BOTH:
+  - Legacy Kaggle CSV data  (s3://bronze/youtube/raw_statistics/region=x/date=x/*.csv)
+  - Live API JSON data      (s3://bronze/youtube/raw_statistics/region=x/date=x/hour=x/*.json)
 
-Improvements over v1:
-  1. requests + urllib3 Retry replaces urllib + manual backoff
-  2. Pagination — follows nextPageToken until exhausted
-  3. Quota tracking — emits EstimatedQuotaUnitsUsed to CloudWatch
-  4. Idempotency guard — skips duplicate writes if EventBridge fires twice
+Applies schema normalisation, cleansing, deduplication, then writes
+unified Parquet to the Silver layer.
 
-Environment Variables:
-    YOUTUBE_API_KEY     — YouTube Data API v3 key
-    S3_BUCKET_BRONZE    — Target S3 bucket for raw data
-    YOUTUBE_REGIONS     — Comma-separated region codes (default: US,GB,CA,...)
-    SNS_ALERT_TOPIC_ARN — SNS topic for failure alerts
+KEY GLUE CONCEPTS IN THIS JOB:
+- GlueContext = Spark + AWS integrations (Catalog, S3, etc.)
+- Glue Data Catalog = central metadata store (tables, schema, partitions)
+- DynamicFrame = Helps read data in glue
+- Sink = Helps write data in glue
+- Bookmarking = incremental processing (handled via job + commit)
 """
 
-import json
-import os
-import logging
-from datetime import datetime, timezone
+import sys
+from datetime import datetime
 
-import boto3
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+# ── Glue-specific imports ─────────────────────────────────────────────────────
+# These are boilerplate and at the top of all glue scripts
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions # helps read parameters
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job # starts and ends the job, also has bookmarking to track which s3 files have been processed
+from awsglue.dynamicframe import DynamicFrame # glue dataframe that deals with schema changes better
 
-# ── Logging ──────────────────────────────────────────────────────────────────
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+# ── Spark imports ─────────────────────────────────────────────────────────────
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from pyspark.sql.types import (
+    StructType, StructField, StringType, LongType, BooleanType, TimestampType
+)
 
-"""Structured JSON logging — queryable in CloudWatch Logs Insights, vs just string with logger.info()"""
-def log(level: str, msg: str, **kwargs) -> None:
-    logger.log(
-        getattr(logging, level.upper()),
-        json.dumps({"message": msg, **kwargs}),
-    )
+# ── Job Setup ────────────────────────────────────────────────────────────────
+args = getResolvedOptions(sys.argv, [
+    "JOB_NAME",
+    "bronze_bucket",
+    "silver_bucket",
+    "silver_database",
+    "silver_table",
+])
 
-
-# ── AWS Clients ──────────────────────────────────────────────────────────────
-s3_client  = boto3.client("s3")
-sns_client = boto3.client("sns")
-cw_client  = boto3.client("cloudwatch")
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args["JOB_NAME"], args)
+logger = glueContext.get_logger()
 
 # ── Config ───────────────────────────────────────────────────────────────────
-API_KEY    = os.environ["YOUTUBE_API_KEY"]
-BUCKET     = os.environ["S3_BUCKET_BRONZE"]
-REGIONS    = os.environ.get("YOUTUBE_REGIONS", "US,GB,CA,DE,FR,IN,JP,KR,MX,RU").split(",")
-SNS_TOPIC  = os.environ.get("SNS_ALERT_TOPIC_ARN", "")
-API_BASE   = "https://www.googleapis.com/youtube/v3"
-MAX_RESULTS = 50
+BRONZE_BUCKET = args["bronze_bucket"]
+SILVER_BUCKET = args["silver_bucket"]
+SILVER_DB     = args["silver_database"]
+SILVER_TABLE  = args["silver_table"]
 
-# YouTube Data API v3 quota costs (units per call)
-# https://developers.google.com/youtube/v3/determine_quota_cost
-QUOTA_COST_VIDEOS     = 100   # videos.list with snippet+statistics+contentDetails
-QUOTA_COST_CATEGORIES = 1     # videoCategories.list
+REGIONS     = ["ca", "gb", "us", "in"]
+BRONZE_BASE = f"s3://{BRONZE_BUCKET}/youtube/raw_statistics/"
+SILVER_PATH = f"s3://{SILVER_BUCKET}/youtube/statistics/"
 
+# Build explicit per-region paths.
+# Using basePath=BRONZE_BASE tells Spark the root of the partition tree,
+# so it injects `region` as a column automatically from the directory name.
+CSV_PATHS  = [f"{BRONZE_BASE}region={r}/" for r in REGIONS]
+JSON_PATHS = [f"{BRONZE_BASE}region={r}/" for r in REGIONS]
 
-# ── HTTP Session ─────────────────────────────────────────────────────────────
-def build_session() -> requests.Session:
-    """
-    Build a requests Session with:
-      - Connection pooling (reused across regions in the same invocation)
-      - Automatic retry with exponential backoff for transient errors
-      - 403 (quota exhausted) is NOT retried — fail fast and surface it
-    """
-    session = requests.Session()
-    retry = Retry(
-        total=3,
-        backoff_factor=1,                        # waits: 1s, 2s, 4s
-        status_forcelist=[429, 500, 502, 503, 504], # 429 and 500 not included by default 
-        allowed_methods=["GET"],
-        raise_on_status=False,                   # we call raise_for_status() ourselves
-    )
-    adapter = HTTPAdapter(max_retries=retry) 
-    session.mount("https://", adapter) # this adds retry logic to your requests session
-    return session
+logger.info(f"Bronze base : {BRONZE_BASE}")
+logger.info(f"Silver      : {SILVER_DB}.{SILVER_TABLE} → {SILVER_PATH}")
 
 
-# Module-level session — reused across warm invocations (no rebuild cost)
-SESSION = build_session()
+# ─────────────────────────────────────────────────────────────────────────────
+# SHARED SILVER SCHEMA
+# Both sources are normalised into this column set before union.
+# ─────────────────────────────────────────────────────────────────────────────
+SILVER_COLUMNS = [
+    "video_id", "trending_date", "title", "channel_title", "category_id",
+    "publish_time", "tags", "views", "likes", "dislikes", "comment_count",
+    "thumbnail_link", "comments_disabled", "ratings_disabled",
+    "video_error_or_removed", "description", "region",
+]
 
 
-# ── YouTube API Calls ────────────────────────────────────────────────────────
-def fetch_trending_videos(region_code: str, api_key: str) -> tuple[list[dict], int]:
-    """
-    Fetch all trending videos for a region, following pagination.
-    Returns (items, pages_fetched).
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 1a: Read CSV (legacy Kaggle data)
+# - basePath tells Spark the partition root → injects `region` column
+# - pathGlobFilter restricts to .csv only → JSON files are ignored
+# - recursiveFileLookup scans all subdirectories (date=x/ etc.)
+# ─────────────────────────────────────────────────────────────────────────────
+logger.info("Reading CSV data from Bronze...")
 
-    Quota cost: QUOTA_COST_VIDEOS per page fetched.
-    """
-    items       = []
-    page_token  = None
-    pages       = 0
-
-    while True:
-        params = {
-            "part": "snippet,statistics,contentDetails",
-            "chart": "mostPopular",
-            "regionCode":  region_code,
-            "maxResults":  MAX_RESULTS,
-            "key":         api_key,
-        }
-        if page_token:
-            params["pageToken"] = page_token
-
-        resp = SESSION.get(f"{API_BASE}/videos", params=params, timeout=30)
-
-        # 403 = quota exhausted; surface it immediately, no retry
-        if resp.status_code == 403:
-            log("error", "quota exhausted or forbidden", region=region_code,
-                status=resp.status_code, body=resp.text[:500])
-            resp.raise_for_status()
-
-        resp.raise_for_status()
-        data = resp.json() # alternative to data = json.loads(resp.text)
-        pages += 1
-
-        items.extend(data.get("items", []))
-        page_token = data.get("nextPageToken")
-
-        if not page_token:
-            break
-
-    return items, pages
-
-
-def fetch_video_categories(region_code: str, api_key: str) -> list[dict]:
-    """
-    Fetch the video category mapping for a region.
-    Single page — the API does not paginate this endpoint.
-
-    Quota cost: QUOTA_COST_CATEGORIES (1 unit).
-    """
-    params = {
-        "part":       "snippet",
-        "regionCode": region_code,
-        "key":        api_key,
-    }
-    resp = SESSION.get(f"{API_BASE}/videoCategories", params=params, timeout=30)
-
-    if resp.status_code == 403:
-        log("error", "quota exhausted or forbidden", region=region_code,
-            status=resp.status_code, body=resp.text[:500])
-        resp.raise_for_status()
-
-    resp.raise_for_status()
-    return resp.json().get("items", [])
-
-
-# ── Quota Tracking ───────────────────────────────────────────────────────────
-def emit_quota_metric(units: int, ingestion_id: str) -> None:
-    """
-    Publish estimated quota units consumed to CloudWatch.
-    Set an alarm at ~8,000 units/day (80% of the free 10,000 quota)
-    to get early warning before the pipeline starts failing with 403s.
-    """
-    try:
-        cw_client.put_metric_data(
-            Namespace="YTPipeline",
-            MetricData=[
-                {
-                    "MetricName": "EstimatedQuotaUnitsUsed",
-                    "Value":      float(units),
-                    "Unit":       "Count",
-                    "Dimensions": [
-                        {"Name": "IngestionId", "Value": ingestion_id}
-                    ],
-                }
-            ],
-        )
-        log("info", "quota metric emitted", units=units, ingestion_id=ingestion_id)
-    except Exception as e:
-        # Non-fatal — don't let metric emission break the pipeline
-        log("warning", "failed to emit quota metric", error=str(e))
-
-
-# ── S3 Helpers ───────────────────────────────────────────────────────────────
-def s3_key_exists(bucket: str, key: str) -> bool:
-    """Return True if the S3 object already exists (idempotency guard)."""
-    try:
-        s3_client.head_object(Bucket=bucket, Key=key)
-        return True
-    except s3_client.exceptions.ClientError:
-        return False
-
-
-def write_to_s3(data: dict, bucket: str, key: str) -> None:
-    """Write JSON data to S3."""
-    s3_client.put_object(
-        Bucket=bucket,
-        Key=key,
-        Body=json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"), 
-        # Python dict → JSON string → UTF-8 bytes → stored in S3, S3's put_object requires bytes
-        ContentType="application/json",
-        Metadata={
-            "ingestion_timestamp": datetime.now(timezone.utc).isoformat(),
-            "source":              "youtube_data_api_v3",
-        },
-    )
-
-
-# ── Alerting ─────────────────────────────────────────────────────────────────
-def send_alert(subject: str, message: str) -> None:
-    if SNS_TOPIC:
-        sns_client.publish(
-            TopicArn=SNS_TOPIC,
-            Subject=subject[:100],
-            Message=message,
-        )
-
-
-# ── Main Handler ─────────────────────────────────────────────────────────────
-def lambda_handler(event, context):
-    """
-    Main handler. Iterates over regions, fetches trending videos
-    and category mappings, writes everything to the Bronze layer.
-
-    The ingestion_id is derived from the EventBridge scheduled event time
-    (event["time"]) rather than datetime.now() so that if the Lambda retries
-    or is invoked twice for the same schedule tick, the S3 keys are identical
-    and the idempotency guard prevents duplicate writes.
-    """
-    # Prefer EventBridge event time for stable, idempotent partitioning
-    event_time_str = event.get("time")
-    if event_time_str:
-        now = datetime.fromisoformat(event_time_str.replace("Z", "+00:00"))
-    else:
-        now = datetime.now(timezone.utc)
-
-    date_partition = now.strftime("%Y-%m-%d")
-    hour_partition = now.strftime("%H")
-    ingestion_id   = now.strftime("%Y%m%d_%H%M%S")
-
-    api_key       = API_KEY
-    results       = {"success": [], "failed": []}
-    total_quota   = 0
-
+try:
+    # recursiveFileLookup + basePath are mutually exclusive in Spark.
+    # With recursiveFileLookup=True, partition discovery is disabled so
+    # `region` is never injected. Fix: read each region path separately
+    # and tag with F.lit(region).
+    csv_frames = []
     for region in REGIONS:
-        region_code = region.strip().lower()   # 
-        log("info", "processing region", region=region_code, ingestion_id=ingestion_id)
-
-        # ── Trending Videos ──────────────────────────────────────────────────
+        region_path = f"{BRONZE_BASE}region={region}/"
         try:
-            s3_key = (
-                f"youtube/raw_statistics/"
-                f"region={region_code}/"
-                f"date={date_partition}/"
-                f"hour={hour_partition}/"
-                f"{ingestion_id}.json"
-            )
+            df_r = (spark.read
+                .option("header", "true")
+                .option("inferSchema", "true")
+                .option("pathGlobFilter", "*.csv")
+                .option("recursiveFileLookup", "true")
+                .csv(region_path)
+                .withColumn("region", F.lit(region)))
+            cnt = df_r.count()
+            logger.info(f"  CSV region={region}: {cnt} records")
+            if cnt > 0:
+                csv_frames.append(df_r)
+        except Exception as re:
+            logger.info(f"  No CSV for region={region}: {re}")
 
-            if s3_key_exists(BUCKET, s3_key):
-                # EventBridge fired twice for the same window — skip safely
-                log("info", "skipping duplicate trending write",
-                    region=region_code, s3_key=s3_key)
-            else:
-                items, pages = fetch_trending_videos(region_code, api_key)
-                total_quota += pages * QUOTA_COST_VIDEOS
+    if csv_frames:
+        df_csv = csv_frames[0]
+        for frame in csv_frames[1:]:
+            df_csv = df_csv.unionByName(frame, allowMissingColumns=True)
+        csv_count = df_csv.count()
+    else:
+        df_csv = spark.createDataFrame([], schema=StructType([]))
+        csv_count = 0
+    logger.info(f"CSV records read total: {csv_count}")
+except Exception as e:
+    logger.info(f"Error reading CSV data: {e}")
+    df_csv = spark.createDataFrame([], schema=StructType([]))
+    csv_count = 0
 
-                payload = {
-                    "items": items,
-                    "_pipeline_metadata": {
-                        "ingestion_id":        ingestion_id,
-                        "region":              region_code,
-                        "ingestion_timestamp": now.isoformat(),
-                        "video_count":         len(items),
-                        "pages_fetched":       pages,
-                        "source":              "youtube_data_api_v3",
-                    },
-                }
-                write_to_s3(payload, BUCKET, s3_key)
-                log("info", "wrote trending videos",
-                    region=region_code, video_count=len(items),
-                    pages=pages, s3_key=s3_key)
 
-        except requests.HTTPError as e:
-            log("error", "HTTP error fetching trending",
-                region=region_code, error=str(e))
-            results["failed"].append(
-                {"region": region_code, "type": "trending", "error": str(e)}
-            )
-            continue   # categories depend on a working API key — skip if trending fails
-        except Exception as e:
-            log("error", "unexpected error fetching trending",
-                region=region_code, error=str(e))
-            results["failed"].append(
-                {"region": region_code, "type": "trending", "error": str(e)}
-            )
-            continue
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 1b: Read JSON (live API data)
+# - basePath tells Spark the partition root → injects `region` column
+# - pathGlobFilter restricts to .json only → CSV files are ignored
+# - multiLine=true because each file is one JSON object (full API envelope)
+# ─────────────────────────────────────────────────────────────────────────────
+logger.info("Reading JSON data from Bronze...")
 
-        # ── Category Reference Data ──────────────────────────────────────────
+try:
+    json_frames = []
+    for region in REGIONS:
+        region_path = f"{BRONZE_BASE}region={region}/"
         try:
-            ref_key = (
-                f"youtube/raw_statistics_reference_data/"
-                f"region={region_code}/"
-                f"date={date_partition}/"
-                f"{region_code}_category_id.json"
-            )
+            df_r = (spark.read
+                .option("multiLine", "true")
+                .option("pathGlobFilter", "*.json")
+                .option("recursiveFileLookup", "true")
+                .json(region_path)
+                .withColumn("region", F.lit(region)))
+            df_r = df_r.filter(F.col("items").isNotNull())
+            cnt = df_r.count()
+            logger.info(f"  JSON region={region}: {cnt} records")
+            if cnt > 0:
+                json_frames.append(df_r)
+        except Exception as re:
+            logger.info(f"  No JSON for region={region}: {re}")
 
-            if s3_key_exists(BUCKET, ref_key):
-                log("info", "skipping duplicate category write",
-                    region=region_code, s3_key=ref_key)
-            else:
-                category_items = fetch_video_categories(region_code, api_key)
-                total_quota   += QUOTA_COST_CATEGORIES
+    if json_frames:
+        df_json = json_frames[0]
+        for frame in json_frames[1:]:
+            df_json = df_json.unionByName(frame, allowMissingColumns=True)
+        json_count = df_json.count()
+    else:
+        df_json = spark.createDataFrame([], schema=StructType([]))
+        json_count = 0
+    logger.info(f"JSON records read total: {json_count}")
+except Exception as e:
+    logger.info(f"Error reading JSON data: {e}")
+    df_json = spark.createDataFrame([], schema=StructType([]))
+    json_count = 0
 
-                payload = {
-                    "items": category_items,
-                    "_pipeline_metadata": {
-                        "ingestion_id":        ingestion_id,
-                        "region":              region_code,
-                        "ingestion_timestamp": now.isoformat(),
-                        "source":              "youtube_data_api_v3",
-                    },
-                }
-                write_to_s3(payload, BUCKET, ref_key)
-                log("info", "wrote category reference",
-                    region=region_code, category_count=len(category_items),
-                    s3_key=ref_key)
+if csv_count == 0 and json_count == 0:
+    logger.info("No data found in Bronze. Committing empty job.")
+    job.commit()
+    sys.exit(0)
 
-        except requests.HTTPError as e:
-            log("error", "HTTP error fetching categories",
-                region=region_code, error=str(e))
-            results["failed"].append(
-                {"region": region_code, "type": "categories", "error": str(e)}
-            )
-            continue
 
-        results["success"].append(region_code)
-
-    # ── Quota metric ─────────────────────────────────────────────────────────
-    emit_quota_metric(total_quota, ingestion_id)
-
-    # ── Summary & alerting ───────────────────────────────────────────────────
-    summary = (
-        f"Ingestion {ingestion_id} complete. "
-        f"Success: {len(results['success'])}/{len(REGIONS)} regions. "
-        f"Failed: {len(results['failed'])}. "
-        f"Estimated quota used: {total_quota} units."
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 2a: Normalise CSV → silver schema
+# ─────────────────────────────────────────────────────────────────────────────
+def normalise_csv(df):
+    """Cast legacy Kaggle CSV columns to the silver schema."""
+    logger.info("Normalising CSV format...")
+    return df.select(
+        F.col("video_id").cast(StringType()),
+        F.col("trending_date").cast(StringType()),
+        F.col("title").cast(StringType()),
+        F.col("channel_title").cast(StringType()),
+        F.col("category_id").cast(LongType()),
+        F.col("publish_time").cast(StringType()),
+        F.col("tags").cast(StringType()),
+        F.col("views").cast(LongType()),
+        F.col("likes").cast(LongType()),
+        F.col("dislikes").cast(LongType()),
+        F.col("comment_count").cast(LongType()),
+        F.col("thumbnail_link").cast(StringType()),
+        F.col("comments_disabled").cast(BooleanType()),
+        F.col("ratings_disabled").cast(BooleanType()),
+        F.col("video_error_or_removed").cast(BooleanType()),
+        F.col("description").cast(StringType()),
+        F.col("region").cast(StringType()),  # from basePath partition discovery
+        F.lit("csv").alias("_source"),
     )
-    log("info", summary, results=results, quota_units=total_quota)
 
-    if results["failed"]:
-        send_alert(
-            subject=f"[YT Pipeline] Partial failure — {ingestion_id}",
-            message=json.dumps(results, indent=2),
-        )
 
-    return {
-        "statusCode":    200,
-        "ingestion_id":  ingestion_id,
-        "quota_units":   total_quota,
-        "results":       results,
-    }
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 2b: Normalise JSON (YouTube API) → silver schema
+# Each file is a full API envelope: {"items": [...], "_pipeline_metadata": {...}}
+# We explode items so each video becomes one row.
+# `region` is already injected by basePath partition discovery.
+# ─────────────────────────────────────────────────────────────────────────────
+def normalise_json(df):
+    """Flatten nested API JSON into the silver schema."""
+    logger.info("Normalising JSON (API) format — exploding items array...")
+
+    df = df.select(
+        F.explode("items").alias("item"),
+        F.col("region"),  # from basePath partition discovery
+    )
+
+    return df.select(
+        F.col("item.id").alias("video_id"),
+        F.lit(datetime.utcnow().strftime("%y.%d.%m")).alias("trending_date"),
+        F.col("item.snippet.title").alias("title"),
+        F.col("item.snippet.channelTitle").alias("channel_title"),
+        F.col("item.snippet.categoryId").cast(LongType()).alias("category_id"),
+        F.col("item.snippet.publishedAt").alias("publish_time"),
+        F.concat_ws("|", F.col("item.snippet.tags")).alias("tags"),  # array → pipe-separated string to match CSV schema
+        F.col("item.statistics.viewCount").cast(LongType()).alias("views"),
+        F.col("item.statistics.likeCount").cast(LongType()).alias("likes"),
+        F.lit(0).cast(LongType()).alias("dislikes"),  # removed from YouTube API Dec 2021
+        F.col("item.statistics.commentCount").cast(LongType()).alias("comment_count"),
+        F.col("item.snippet.thumbnails.default.url").alias("thumbnail_link"),
+        F.lit(False).alias("comments_disabled"),
+        F.lit(False).alias("ratings_disabled"),
+        F.lit(False).alias("video_error_or_removed"),
+        F.col("item.snippet.description").alias("description"),
+        F.col("region"),
+        F.lit("api").alias("_source"),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 3: Union both sources
+# ─────────────────────────────────────────────────────────────────────────────
+frames = []
+if csv_count > 0:
+    frames.append(normalise_csv(df_csv))
+if json_count > 0:
+    frames.append(normalise_json(df_json))
+
+df = frames[0] if len(frames) == 1 else frames[0].unionByName(frames[1])
+logger.info(f"Combined record count before cleansing: {df.count()}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 4: Cleansing
+# ─────────────────────────────────────────────────────────────────────────────
+logger.info("Cleansing data...")
+
+df = df.filter(F.col("video_id").isNotNull())
+df = df.withColumn("region", F.lower(F.trim(F.col("region"))))
+
+# Parse inconsistent date formats (yy.dd.MM from CSV, ISO from API)
+df = df.withColumn(
+    "trending_date_parsed",
+    F.when(
+        F.col("trending_date").rlike(r"^\d{2}\.\d{2}\.\d{2}$"),
+        F.to_date(F.col("trending_date"), "yy.dd.MM")
+    ).otherwise(
+        F.to_date(F.col("trending_date"))
+    )
+)
+
+# Fill null numeric fields
+for col_name in ["views", "likes", "dislikes", "comment_count"]:
+    df = df.withColumn(col_name, F.coalesce(F.col(col_name), F.lit(0)))
+
+# Derived metrics
+df = df.withColumn("like_ratio",
+    F.when(F.col("views") > 0,
+           F.round(F.col("likes") / F.col("views") * 100, 4)
+    ).otherwise(0.0)
+)
+df = df.withColumn("engagement_rate",
+    F.when(F.col("views") > 0,
+           F.round((F.col("likes") + F.col("dislikes") + F.col("comment_count")) / F.col("views") * 100, 4)
+    ).otherwise(0.0)
+)
+
+# Lineage metadata
+df = df.withColumn("_processed_at", F.current_timestamp())
+df = df.withColumn("_job_name", F.lit(args["JOB_NAME"]))
+# CSV tags use pipe-separated values (e.g. "tag1|tag2"); API tags are arrays/null
+# _source was stamped inside normalise_csv / normalise_json — no derivation needed here.
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 5: Deduplication
+# Prefer API records over CSV for the same video+region+date.
+# ─────────────────────────────────────────────────────────────────────────────
+logger.info("Deduplicating (API records preferred over CSV)...")
+
+window = Window.partitionBy("video_id", "region", "trending_date_parsed") \
+    .orderBy(
+        F.when(F.col("_source") == "api", 0).otherwise(1),  # api wins
+        F.col("_processed_at").desc()
+    )
+
+df = df.withColumn("_row_num", F.row_number().over(window)) \
+       .filter(F.col("_row_num") == 1) \
+       .drop("_row_num")
+
+logger.info(f"Records after deduplication: {df.count()}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 6: Write to Silver
+# ─────────────────────────────────────────────────────────────────────────────
+logger.info(f"Writing to Silver: {SILVER_PATH}")
+
+dynamic_frame = DynamicFrame.fromDF(df, glueContext, "silver_statistics")
+
+sink = glueContext.getSink(
+    connection_type="s3",
+    path=SILVER_PATH,
+    enableUpdateCatalog=True,
+    updateBehavior="UPDATE_IN_DATABASE",
+    partitionKeys=["region"],
+)
+sink.setCatalogInfo(
+    catalogDatabase=SILVER_DB,
+    catalogTableName=SILVER_TABLE
+)
+sink.setFormat("glueparquet", compression="snappy")
+sink.writeFrame(dynamic_frame)
+
+logger.info("Silver write complete.")
+
+job.commit()
