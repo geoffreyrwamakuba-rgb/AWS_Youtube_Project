@@ -49,8 +49,6 @@ A fully automated pipeline that:
 
 **The pipeline follows a DAG structure:**
 
-Ingestion Layer --> Processing Layer --> Storage Layer --> Analytics Layer
-
 ![ ](https://github.com/geoffreyrwamakuba-rgb/AWS_Youtube_Project/blob/4144f6a8b43428482cfd3e4ff1f74559755a1022/Images/stepfunctions_graph.svg)
 ---
 
