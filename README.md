@@ -27,7 +27,7 @@ Tech Stack
 ### Context
 
 A marketing client wants to understand:
-- What content performs best across regions
+- What content performs best across regions?
 - Trends in engagement (views, likes, comments)
 - Category-level performance
 - Opportunities for campaign optimisation
